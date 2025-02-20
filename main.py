@@ -2,6 +2,7 @@ import ollama
 import json
 import os
 import asyncio
+import aiohttp
 import colorama
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
@@ -15,6 +16,7 @@ key_memory_file = "key_memories.json"
 deep_memory_file = "deep_memory.json"
 compiled_memory_file = "compiled_memory.json"
 system_prompt_file = "system_prompt.json"
+ollama_url = "http://localhost:11434/api/chat"
 max_tokens = 65536
 max_prompt_tokens = 16384
 max_response_tokens = 16384
@@ -24,6 +26,7 @@ max_context_size = 8192
 memory_window = 4
 max_history_size = 50
 compile_interval = 50
+token_display_delay = 0.01  # Faster delay for smoother display
 
 def load_system_prompt(file_path):
     """Loads system prompt from a JSON file"""
@@ -35,6 +38,41 @@ def load_system_prompt(file_path):
         return {"role": "system", "content": "Default assistant prompt"}
 
 SYSTEM_PROMPT = load_system_prompt(system_prompt_file)
+
+async def type_text(text, color=colorama.Fore.GREEN, delay=0.02):
+    """Prints text gradually with a delay between characters"""
+    for char in text:
+        print(color + char, end='', flush=True)
+        await asyncio.sleep(delay)
+    print(colorama.Style.RESET_ALL)
+
+async def display_token(token, in_code_block=False, last_token_was_space=False):
+    """Displays a token with proper spacing and code block handling"""
+    if not token.strip() and not in_code_block:
+        return last_token_was_space  # Skip empty tokens outside code blocks
+    
+    if token.startswith('```') or token.endswith('```'):
+        if in_code_block and token.endswith('```'):
+            print(colorama.Fore.GREEN + token, end='\n', flush=True)
+            await asyncio.sleep(token_display_delay)
+            return False
+        elif not in_code_block and token.startswith('```'):
+            print(colorama.Fore.GREEN + token, end='\n', flush=True)
+            await asyncio.sleep(token_display_delay)
+            return True
+        return in_code_block  # Skip further processing if token is just '```'
+
+    if in_code_block:
+        print(colorama.Fore.GREEN + token, end='', flush=True)
+        await asyncio.sleep(token_display_delay)
+        return token.endswith('\n') or token.endswith(' ')
+    
+    # Handle natural text outside code blocks
+    if last_token_was_space and not token.startswith(('.', ',', '!', '?', ':', ';', '\n', ' ')):
+        print(colorama.Fore.GREEN + ' ', end='', flush=True)
+    print(colorama.Fore.GREEN + token, end='', flush=True)
+    await asyncio.sleep(token_display_delay)
+    return token.endswith(' ') or token.endswith('\n')
 
 def estimate_tokens(text):
     return len(text) // 4 + 1
@@ -71,7 +109,6 @@ def compile_memory(chat_history, key_memories, previous_compiled_memory):
     existing_contents = {msg["content"] for msg in previous_compiled_memory}
     keywords = Counter()
 
-    # Collect from chat_history
     for msg in chat_history:
         if msg["role"] == "user":
             compiled_content = f"User said: {msg['content']}"
@@ -80,12 +117,10 @@ def compile_memory(chat_history, key_memories, previous_compiled_memory):
                 words = msg["content"].lower().split()
                 keywords.update([w for w in words if w in ["love", "want", "called"]])
 
-    # Add key_memories, excluding duplicates
     for msg in key_memories:
         if msg["content"] not in existing_contents:
             compiled.append({"role": "compiled", "content": msg["content"]})
 
-    # Exclude duplicates based on key phrases
     final_compiled = []
     seen_keywords = set()
     for entry in compiled:
@@ -167,41 +202,83 @@ async def save_memory(memory, file_path, max_size=None):
 
 async def process_prompt_part(prompt_part, chat_history, key_memories, deep_memory, compiled_memory):
     prompt_tokens = estimate_tokens(prompt_part)
-    print(f"{colorama.Fore.CYAN}ℹ️ Processing prompt part, tokens: {prompt_tokens}{colorama.Style.RESET_ALL}")
+    await type_text(f"ℹ️ Processing prompt part, tokens: {prompt_tokens}", colorama.Fore.CYAN, delay=0.02)
     
     context_parts, was_split = await split_context(chat_history, prompt_part, key_memories, deep_memory, compiled_memory, max_tokens)
     part_response = ""
 
-    if not was_split:
-        messages = context_parts[0]
-        total_tokens = estimate_tokens("\n".join(f"{m['role']}: {m['content']}" for m in messages))
-        print(f"{colorama.Fore.CYAN}ℹ️ Total context: {total_tokens} tokens{colorama.Style.RESET_ALL}")
-        
-        if any(keyword in prompt_part.lower() for keyword in ["who am i", "what do you know", "what do you remember"]):
-            user_info = "\nKnown about user:\n"
-            for msg in deep_memory + chat_history:
-                if msg["role"] == "user" and any(kw in msg["content"].lower() for kw in ["called", "love", "want"]):
-                    user_info += f"- {msg['content']}\n"
-            messages.insert(-1, {"role": "system", "content": user_info if user_info.strip() != "Known about user:" else "I don’t know much about you yet, tell me something!"})
+    async with aiohttp.ClientSession() as session:
+        if not was_split:
+            messages = context_parts[0]
+            total_tokens = estimate_tokens("\n".join(f"{m['role']}: {m['content']}" for m in messages))
+            await type_text(f"ℹ️ Total context: {total_tokens} tokens", colorama.Fore.CYAN, delay=0.02)
 
-        try:
-            response = await asyncio.to_thread(ollama.chat, model=model_name, messages=messages, options={"num_ctx": max_context_size})
-            part_response = response["message"]["content"]
-        except Exception as e:
-            print(f"{colorama.Fore.RED}⚠️ Error processing prompt part: {e}{colorama.Style.RESET_ALL}")
-            part_response = "[Error]"
-    else:
-        for i, part in enumerate(context_parts):
-            total_tokens = estimate_tokens("\n".join(f"{m['role']}: {m['content']}" for m in part))
-            print(f"{colorama.Fore.CYAN}ℹ️ Processing context part {i + 1}/{len(context_parts)}, tokens: {total_tokens}{colorama.Style.RESET_ALL}")
-            try:
-                response = await asyncio.to_thread(ollama.chat, model=model_name, messages=part, options={"num_ctx": max_context_size})
-                part_response += response["message"]["content"] + " "
-            except Exception as e:
-                print(f"{colorama.Fore.RED}⚠️ Error processing context part {i + 1}: {e}{colorama.Style.RESET_ALL}")
-                part_response += "[Error] "
+            if any(keyword in prompt_part.lower() for keyword in ["who am i", "what do you know", "what do you remember"]):
+                user_info = "\nKnown about user:\n"
+                for msg in deep_memory + chat_history:
+                    if msg["role"] == "user" and any(kw in msg["content"].lower() for kw in ["called", "love", "want"]):
+                        user_info += f"- {msg['content']}\n"
+                messages.insert(-1, {"role": "system", "content": user_info if user_info.strip() != "Known about user:" else "I don’t know much about you yet, tell me something!"})
 
-    return part_response
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "stream": True,
+                "options": {"num_ctx": max_context_size}
+            }
+            async with session.post(ollama_url, json=payload) as response:
+                if response.status != 200:
+                    await type_text(f"⚠️ Error: HTTP {response.status}", colorama.Fore.RED, delay=0.02)
+                    return "[Error]"
+                
+                response_text = ""
+                in_code_block = False
+                last_token_was_space = False
+                async for line in response.content:
+                    try:
+                        chunk = json.loads(line.decode('utf-8'))
+                        if "message" in chunk and "content" in chunk["message"]:
+                            token = chunk["message"]["content"]
+                            response_text += token
+                            last_token_was_space = await display_token(token, in_code_block, last_token_was_space)
+                            in_code_block = last_token_was_space if token.startswith('```') or token.endswith('```') else in_code_block
+                    except json.JSONDecodeError:
+                        continue
+                part_response = response_text.strip()
+        else:
+            for i, part in enumerate(context_parts):
+                total_tokens = estimate_tokens("\n".join(f"{m['role']}: {m['content']}" for m in part))
+                await type_text(f"ℹ️ Processing context part {i + 1}/{len(context_parts)}, tokens: {total_tokens}", colorama.Fore.CYAN, delay=0.02)
+                
+                payload = {
+                    "model": model_name,
+                    "messages": part,
+                    "stream": True,
+                    "options": {"num_ctx": max_context_size}
+                }
+                async with session.post(ollama_url, json=payload) as response:
+                    if response.status != 200:
+                        await type_text(f"⚠️ Error: HTTP {response.status}", colorama.Fore.RED, delay=0.02)
+                        part_response += "[Error] "
+                        continue
+
+                    response_text = ""
+                    in_code_block = False
+                    last_token_was_space = False
+                    async for line in response.content:
+                        try:
+                            chunk = json.loads(line.decode('utf-8'))
+                            if "message" in chunk and "content" in chunk["message"]:
+                                token = chunk["message"]["content"]
+                                response_text += token
+                                last_token_was_space = await display_token(token, in_code_block, last_token_was_space)
+                                in_code_block = last_token_was_space if token.startswith('```') or token.endswith('```') else in_code_block
+                        except json.JSONDecodeError:
+                            continue
+                    part_response += response_text.strip() + " "
+
+    print(colorama.Style.RESET_ALL)  # Reset color after streaming
+    return part_response.strip()
 
 async def main():
     chat_history = await load_memory(memory_file)
@@ -210,15 +287,25 @@ async def main():
     compiled_memory = await load_memory(compiled_memory_file)
     message_count = len(chat_history) // 2
 
-    print(f"{colorama.Fore.GREEN}🤖 Started {model_name}. Enter 'exit', 'clear', 'remember', 'remember key moment', or 'recall'.{colorama.Style.RESET_ALL}")
-    print(f"{colorama.Fore.CYAN}ℹ️ Max tokens: {max_tokens}, Max prompt tokens: {max_prompt_tokens}, Max response tokens: {max_response_tokens}, Max chat tokens: {max_chat_tokens}, Max deep tokens: {max_deep_tokens}, Context size: {max_context_size}{colorama.Style.RESET_ALL}")
+    await type_text(f"🤖 Started {model_name}. Use slash commands: /exit, /clear, /remember, /remember_key_moment, /recall, /remember N messages.", delay=0.02)
+    await type_text(f"ℹ️ Max tokens: {max_tokens}, Max prompt tokens: {max_prompt_tokens}, Max response tokens: {max_response_tokens}, Max chat tokens: {max_chat_tokens}, Max deep tokens: {max_deep_tokens}, Context size: {max_context_size}", colorama.Fore.CYAN, delay=0.02)
 
     while True:
         try:
             user_input = input(f"{colorama.Fore.YELLOW}You: {colorama.Style.RESET_ALL}")
+            input_lower = user_input.lower().strip()
 
-            if user_input.lower() in ["exit"]:
-                print(f"{colorama.Fore.GREEN}🤖 Shutting down...{colorama.Style.RESET_ALL}")
+            if input_lower.startswith("/"):
+                command = input_lower
+            else:
+                command_keywords = ["exit", "clear", "remember", "recall", "key", "moment", "messages", "запомнить", "вспомнить", "очистить"]
+                if any(keyword in input_lower for keyword in command_keywords):
+                    command = await process_command_with_ai(user_input, chat_history)
+                else:
+                    command = None
+
+            if command and command.startswith("/exit"):
+                await type_text("🤖 Shutting down...", delay=0.02)
                 await asyncio.gather(
                     save_memory(chat_history, memory_file, max_chat_tokens),
                     save_memory(key_memories, key_memory_file),
@@ -226,7 +313,7 @@ async def main():
                     save_memory(compiled_memory, compiled_memory_file)
                 )
                 break
-            elif user_input.lower() in ["clear"]:
+            elif command and command.startswith("/clear"):
                 chat_history = []
                 key_memories = []
                 deep_memory = []
@@ -238,55 +325,57 @@ async def main():
                     save_memory(deep_memory, deep_memory_file),
                     save_memory(compiled_memory, compiled_memory_file)
                 )
-                print(f"{colorama.Fore.GREEN}🤖 Memory cleared.{colorama.Style.RESET_ALL}")
+                await type_text("🤖 Memory cleared.", delay=0.02)
                 continue
-            elif user_input.lower() == "remember":
+            elif command and command.startswith("/remember") and "key_moment" not in command and "messages" not in command:
                 if chat_history:
                     summary = summarize_key_points(chat_history)
-                    deep_memory.extend(summary)  # To deep memory
+                    deep_memory.extend(summary)
                     await save_memory(deep_memory, deep_memory_file, max_deep_tokens)
-                    print(f"{colorama.Fore.GREEN}🤖 Deep memory updated:{colorama.Style.RESET_ALL} {[msg['content'] for msg in summary]}")
+                    await type_text(f"🤖 Deep memory updated: {[msg['content'] for msg in summary]}", delay=0.02)
                 else:
-                    print(f"{colorama.Fore.YELLOW}🤖 No history to remember.{colorama.Style.RESET_ALL}")
+                    await type_text("🤖 No history to remember.", colorama.Fore.YELLOW, delay=0.02)
                 continue
-            elif user_input.lower() == "remember key moment":
+            elif command and command.startswith("/remember_key_moment"):
                 if chat_history:
                     summary = summarize_key_points(chat_history, num_messages=3)
                     key_memories.extend(summary)
                     await save_memory(key_memories, key_memory_file)
-                    print(f"{colorama.Fore.GREEN}🤖 Key moments updated:{colorama.Style.RESET_ALL} {[msg['content'] for msg in summary]}")
+                    await type_text(f"🤖 Key moments updated: {[msg['content'] for msg in summary]}", delay=0.02)
                 else:
-                    print(f"{colorama.Fore.YELLOW}🤖 No history to remember.{colorama.Style.RESET_ALL}")
+                    await type_text("🤖 No history to remember.", colorama.Fore.YELLOW, delay=0.02)
                 continue
-            elif user_input.lower().startswith("remember ") and "messages" in user_input.lower():
+            elif command and command.startswith("/remember") and "messages" in command:
                 try:
-                    num = int(user_input.split()[1])
+                    parts = command.split()
+                    num = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 3
                     if chat_history:
                         summary = summarize_key_points(chat_history, num_messages=num)
                         key_memories.extend(summary)
                         await save_memory(key_memories, key_memory_file)
-                        print(f"{colorama.Fore.GREEN}🤖 Key moments updated ({num} messages):{colorama.Style.RESET_ALL} {[msg['content'] for msg in summary]}")
+                        await type_text(f"🤖 Key moments updated ({num} messages): {[msg['content'] for msg in summary]}", delay=0.02)
                     else:
-                        print(f"{colorama.Fore.YELLOW}🤖 No history to remember.{colorama.Style.RESET_ALL}")
+                        await type_text("🤖 No history to remember.", colorama.Fore.YELLOW, delay=0.02)
                 except ValueError:
-                    print(f"{colorama.Fore.RED}⚠️ Specify a number, e.g., 'remember 5 messages'{colorama.Style.RESET_ALL}")
+                    await type_text("⚠️ Specify a number, e.g., '/remember 5 messages'", colorama.Fore.RED, delay=0.02)
                 continue
-            elif user_input.lower() == "recall":
+            elif command and command.startswith("/recall"):
                 if chat_history or deep_memory or compiled_memory or key_memories:
-                    print(f"{colorama.Fore.GREEN}🤖 Here’s what I remember about you:{colorama.Style.RESET_ALL}")
+                    await type_text("🤖 Here’s what I remember about you:", delay=0.02)
                     if deep_memory:
-                        print(f"{colorama.Fore.CYAN}From deep memory (preferences):{colorama.Style.RESET_ALL} {[msg['content'] for msg in deep_memory]}")
+                        await type_text(f"From deep memory (preferences): {[msg['content'] for msg in deep_memory]}", colorama.Fore.CYAN, delay=0.02)
                     if key_memories:
-                        print(f"{colorama.Fore.CYAN}From key moments:{colorama.Style.RESET_ALL} {[msg['content'] for msg in key_memories]}")
+                        await type_text(f"From key moments: {[msg['content'] for msg in key_memories]}", colorama.Fore.CYAN, delay=0.02)
                     if compiled_memory:
-                        print(f"{colorama.Fore.CYAN}From compiled memory:{colorama.Style.RESET_ALL} {[msg['content'] for msg in compiled_memory][-5:]}")
+                        await type_text(f"From compiled memory: {[msg['content'] for msg in compiled_memory][-5:]}", colorama.Fore.CYAN, delay=0.02)
                     if chat_history:
                         user_info = [msg["content"] for msg in chat_history if msg["role"] == "user"]
-                        print(f"{colorama.Fore.CYAN}From current session:{colorama.Style.RESET_ALL} {user_info}")
+                        await type_text(f"From current session: {user_info}", colorama.Fore.CYAN, delay=0.02)
                 else:
-                    print(f"{colorama.Fore.YELLOW}🤖 I don’t know anything about you yet.{colorama.Style.RESET_ALL}")
+                    await type_text("🤖 I don’t know anything about you yet.", colorama.Fore.YELLOW, delay=0.02)
                 continue
 
+            # Regular message processing if not a command
             prompt_parts = split_text(user_input, max_prompt_tokens, type="prompt")
             combined_response = ""
 
@@ -294,16 +383,7 @@ async def main():
             responses = await asyncio.gather(*tasks)
 
             for part_response in responses:
-                response_tokens = estimate_tokens(part_response)
-                if response_tokens > max_response_tokens:
-                    response_parts = split_text(part_response, max_response_tokens, type="response")
-                    for k, resp_part in enumerate(response_parts):
-                        resp_tokens = estimate_tokens(resp_part)
-                        print(f"{colorama.Fore.GREEN}AI (part {k + 1}/{len(response_parts)}, tokens: {resp_tokens}): {resp_part}{colorama.Style.RESET_ALL}")
-                        combined_response += resp_part + " "
-                else:
-                    print(f"{colorama.Fore.GREEN}AI (tokens: {response_tokens}): {part_response}{colorama.Style.RESET_ALL}")
-                    combined_response += part_response + " "
+                combined_response += part_response + " "
 
             combined_response = combined_response.strip()
             chat_history.append({"role": "user", "content": user_input})
@@ -316,14 +396,14 @@ async def main():
                 await save_memory(compiled_memory, compiled_memory_file)
                 chat_history = chat_history[-max_history_size * 2:]
                 message_count = 0
-                print(f"{colorama.Fore.GREEN}🤖 Memory compiled:{colorama.Style.RESET_ALL} {[msg['content'] for msg in new_compiled_block]}")
+                await type_text(f"🤖 Memory compiled: {[msg['content'] for msg in new_compiled_block]}", delay=0.02)
             else:
                 if len(chat_history) > max_history_size * 2:
                     chat_history = chat_history[-max_history_size * 2:]
                 await save_memory(chat_history, memory_file, max_chat_tokens)
 
         except KeyboardInterrupt:
-            print(f"\n{colorama.Fore.GREEN}🤖 Shutting down due to interruption...{colorama.Style.RESET_ALL}")
+            await type_text("🤖 Shutting down due to interruption...", delay=0.02)
             await asyncio.gather(
                 save_memory(chat_history, memory_file, max_chat_tokens),
                 save_memory(key_memories, key_memory_file),
@@ -332,7 +412,7 @@ async def main():
             )
             break
         except Exception as e:
-            print(f"{colorama.Fore.RED}⚠️ Error: {e}{colorama.Style.RESET_ALL}")
+            await type_text(f"⚠️ Error: {e}", colorama.Fore.RED, delay=0.02)
 
 if __name__ == "__main__":
     asyncio.run(main())
