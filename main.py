@@ -16,6 +16,7 @@ key_memory_file = "key_memories.json"
 deep_memory_file = "deep_memory.json"
 compiled_memory_file = "compiled_memory.json"
 system_prompt_file = "system_prompt.json"
+custom_settings_file = "custom_settings.json"  # New file for user settings
 ollama_url = "http://localhost:11434/api/chat"
 max_tokens = 65536
 max_prompt_tokens = 16384
@@ -37,7 +38,21 @@ def load_system_prompt(file_path):
         print(f"{colorama.Fore.RED}⚠️ System prompt file not found: {file_path}{colorama.Style.RESET_ALL}")
         return {"role": "system", "content": "Default assistant prompt"}
 
+def load_custom_settings(file_path):
+    """Loads custom user settings from a JSON file"""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+            return settings.get("custom_instructions", "")
+    except FileNotFoundError:
+        print(f"{colorama.Fore.YELLOW}ℹ️ Custom settings file not found: {file_path}. Using default behavior.{colorama.Style.RESET_ALL}")
+        return ""
+    except json.JSONDecodeError:
+        print(f"{colorama.Fore.RED}⚠️ Error decoding {file_path}. Using default behavior.{colorama.Style.RESET_ALL}")
+        return ""
+
 SYSTEM_PROMPT = load_system_prompt(system_prompt_file)
+CUSTOM_INSTRUCTIONS = load_custom_settings(custom_settings_file)
 
 async def type_text(text, color=colorama.Fore.GREEN, delay=0.02):
     """Prints text gradually with a delay between characters"""
@@ -134,6 +149,8 @@ def compile_memory(chat_history, key_memories, previous_compiled_memory):
 
 async def split_context(chat_history, user_input_part, key_memories, deep_memory, compiled_memory, max_tokens):
     context_parts = [SYSTEM_PROMPT["content"]]
+    if CUSTOM_INSTRUCTIONS:  # Add custom instructions to context
+        context_parts.append(f"Custom Instructions: {CUSTOM_INSTRUCTIONS}")
     if deep_memory:
         context_parts.append("Deep Memory (preferences):")
         context_parts.extend(f"{msg['role']}: {msg['content']}" for msg in deep_memory)
@@ -149,20 +166,22 @@ async def split_context(chat_history, user_input_part, key_memories, deep_memory
 
     total_tokens = estimate_tokens("\n".join(context_parts))
     if total_tokens <= max_tokens:
-        return [[SYSTEM_PROMPT] + deep_memory + key_memories + compiled_memory + chat_history[-max_history_size:] + [{"role": "user", "content": user_input_part}]], False
+        return [[SYSTEM_PROMPT] + 
+                ([{"role": "system", "content": f"Custom Instructions: {CUSTOM_INSTRUCTIONS}"}] if CUSTOM_INSTRUCTIONS else []) + 
+                deep_memory + key_memories + compiled_memory + chat_history[-max_history_size:] + [{"role": "user", "content": user_input_part}]], False
 
     parts = []
-    current_part = [SYSTEM_PROMPT] + deep_memory.copy()
-    current_tokens = estimate_tokens(SYSTEM_PROMPT["content"]) + sum(estimate_tokens(msg["content"]) for msg in deep_memory)
+    current_part = [SYSTEM_PROMPT] + ([{"role": "system", "content": f"Custom Instructions: {CUSTOM_INSTRUCTIONS}"}] if CUSTOM_INSTRUCTIONS else []) + deep_memory.copy()
+    current_tokens = estimate_tokens(SYSTEM_PROMPT["content"]) + (estimate_tokens(CUSTOM_INSTRUCTIONS) if CUSTOM_INSTRUCTIONS else 0) + sum(estimate_tokens(msg["content"]) for msg in deep_memory)
     split_occurred = False
 
     all_messages = key_memories + compiled_memory + chat_history[-max_history_size:] + [{"role": "user", "content": user_input_part}]
     for msg in all_messages:
         msg_tokens = estimate_tokens(msg["content"])
-        if current_tokens + msg_tokens > max_tokens and len(current_part) > len(deep_memory) + 1:
+        if current_tokens + msg_tokens > max_tokens and len(current_part) > len(deep_memory) + (1 if CUSTOM_INSTRUCTIONS else 0) + 1:
             parts.append(current_part)
-            current_part = [SYSTEM_PROMPT] + deep_memory.copy() + [msg]
-            current_tokens = estimate_tokens(SYSTEM_PROMPT["content"]) + sum(estimate_tokens(m["content"]) for m in deep_memory) + msg_tokens
+            current_part = [SYSTEM_PROMPT] + ([{"role": "system", "content": f"Custom Instructions: {CUSTOM_INSTRUCTIONS}"}] if CUSTOM_INSTRUCTIONS else []) + deep_memory.copy() + [msg]
+            current_tokens = estimate_tokens(SYSTEM_PROMPT["content"]) + (estimate_tokens(CUSTOM_INSTRUCTIONS) if CUSTOM_INSTRUCTIONS else 0) + sum(estimate_tokens(m["content"]) for m in deep_memory) + msg_tokens
             split_occurred = True
         else:
             current_part.append(msg)
@@ -289,6 +308,8 @@ async def main():
 
     await type_text(f"🤖 Started {model_name}. Use slash commands: /exit, /clear, /remember, /remember_key_moment, /recall, /remember N messages.", delay=0.02)
     await type_text(f"ℹ️ Max tokens: {max_tokens}, Max prompt tokens: {max_prompt_tokens}, Max response tokens: {max_response_tokens}, Max chat tokens: {max_chat_tokens}, Max deep tokens: {max_deep_tokens}, Context size: {max_context_size}", colorama.Fore.CYAN, delay=0.02)
+    if CUSTOM_INSTRUCTIONS:
+        await type_text(f"ℹ️ Custom instructions loaded: {CUSTOM_INSTRUCTIONS}", colorama.Fore.CYAN, delay=0.02)
 
     while True:
         try:
