@@ -30,12 +30,12 @@ token_display_delay = 0.01  # Faster delay for smoother display
 
 SYSTEM_PROMPT = {
     "role": "system",
-    "content": """You are a friendly and smart AI assistant. Respond concisely and formally, avoiding slang, with a focus on technical accuracy. Use all information from the current session (chat_history), key moments (key_memories), deep memory (deep_memory), and compiled memory (compiled_memory). Automatically categorize and store user input logically into deep memory (personal preferences, identity) or key memory (important events, actions) based on an importance scale: deep for personal details (e.g., 'love', 'want', 'called'), key for significant events (e.g., 'did', 'happened', 'important'). Summarize and incorporate relevant info from the last 2 messages in chat_history into responses to maintain context. If the user says 'запомни' or 'remember', save the specified info or the last assistant response to key memory.
-- If asked 'how are you?', reply: 'I am functioning well, thank you. How are you?'
-- If asked about plans, reply: 'My purpose is to assist users effectively. What are your plans?'
-- If asked about the user ('who am I?', 'what do you know about me?'), provide a concise, formal summary of key facts from deep memory, key moments, and the current session.
-- If no data is available, say: 'I have limited information about you so far. Please share more about yourself.'
-- For general questions, provide clear and accurate responses or request clarification."""
+    "content": """You are a concise, formal, and technically accurate AI assistant. Respond briefly and logically, avoiding slang and unnecessary details. Use information from chat_history, key_memories, deep_memory, and compiled_memory to form responses. Automatically categorize user input: deep memory for personal preferences and identity (e.g., 'love', 'want', 'called'), key memory for significant events (e.g., 'did', 'happened', 'important'). When responding, summarize relevant data from the last 2 chat_history messages and memory into a compact, coherent statement, excluding redundant info. If the user says 'запомни' or 'remember', save the specified info or the last assistant response to key memory.
+- For 'how are you?', reply: 'I am functioning well, thank you. How are you?'
+- For plans, reply: 'My purpose is to assist users effectively. What are your plans?'
+- For user info requests ('who am I?', 'what do you know about me?'), provide a concise summary of key facts from all memory sources.
+- If no data exists, say: 'I have limited information about you so far. Please share more.'
+- For general queries, offer clear answers or seek clarification."""
 }
 
 def load_custom_settings(file_path):
@@ -114,8 +114,9 @@ def split_text(text, max_tokens, type="prompt"):
 def analyze_input_for_memory(text):
     """Analyzes user input to determine if it should go to key or deep memory"""
     text_lower = text.lower()
-    deep_keywords = ["люблю", "хочу", "зовут", "мой", "мне", "предпочитаю", "обожаю", "love", "want", "called", "my", "i", "prefer"]
+    deep_keywords = ["люблю", "хочу", "зовут", "мой", "мне", "предпочитаю", "обожаю", "тащусь", "love", "want", "called", "my", "i", "prefer"]
     key_keywords = ["сделал", "произошло", "важно", "событие", "did", "happened", "important", "event"]
+    # Exclude questions unless explicitly told to remember
     if text_lower.endswith("?") or any(q in text_lower for q in ["что", "как", "кто", "где", "когда", "почему", "what", "how", "who", "where", "when", "why"]):
         return None
     
@@ -490,6 +491,35 @@ def summarize_key_points(chat_history, num_messages=3):
     """Summarizes the last num_messages user messages"""
     user_messages = [msg for msg in chat_history if msg["role"] == "user"][-num_messages:]
     return user_messages[:min(num_messages, len(user_messages))]
+
+def compile_memory(chat_history, key_memories, previous_compiled_memory):
+    """Compiles chat_history and key_memories into compiled_memory with duplicate check"""
+    compiled = []
+    existing_contents = {msg["content"] for msg in previous_compiled_memory}
+    keywords = Counter()
+
+    for msg in chat_history:
+        if msg["role"] == "user":
+            compiled_content = f"User said: {msg['content']}"
+            if compiled_content not in existing_contents:
+                compiled.append({"role": "compiled", "content": compiled_content})
+                words = msg["content"].lower().split()
+                keywords.update([w for w in words if w in ["love", "want", "called"]])
+
+    for msg in key_memories:
+        if msg["content"] not in existing_contents:
+            compiled.append({"role": "compiled", "content": msg["content"]})
+
+    final_compiled = []
+    seen_keywords = set()
+    for entry in compiled:
+        content_lower = entry["content"].lower()
+        key_phrase = tuple(w for w in content_lower.split() if w in ["love", "want", "called"])
+        if key_phrase not in seen_keywords or "User said" not in entry["content"]:
+            final_compiled.append(entry)
+            seen_keywords.add(key_phrase)
+
+    return final_compiled
 
 if __name__ == "__main__":
     asyncio.run(main())
