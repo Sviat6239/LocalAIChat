@@ -15,8 +15,7 @@ memory_file = "chat_memory.json"
 key_memory_file = "key_memories.json"
 deep_memory_file = "deep_memory.json"
 compiled_memory_file = "compiled_memory.json"
-system_prompt_file = "system_prompt.json"
-custom_settings_file = "custom_settings.json"  # New file for user settings
+custom_settings_file = "custom_settings.json"
 ollama_url = "http://localhost:11434/api/chat"
 max_tokens = 65536
 max_prompt_tokens = 16384
@@ -29,14 +28,15 @@ max_history_size = 50
 compile_interval = 50
 token_display_delay = 0.01  # Faster delay for smoother display
 
-def load_system_prompt(file_path):
-    """Loads system prompt from a JSON file"""
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        print(f"{colorama.Fore.RED}⚠️ System prompt file not found: {file_path}{colorama.Style.RESET_ALL}")
-        return {"role": "system", "content": "Default assistant prompt"}
+SYSTEM_PROMPT = {
+    "role": "system",
+    "content": """You are a friendly and smart AI assistant. Respond concisely and formally, avoiding slang, with a focus on technical accuracy. Use all information from the current session (chat_history), key moments (key_memories), deep memory (deep_memory), and compiled memory (compiled_memory). Automatically categorize and store user input logically into deep memory (personal preferences, identity) or key memory (important events, actions) based on an importance scale: deep for personal details (e.g., 'love', 'want', 'called'), key for significant events (e.g., 'did', 'happened', 'important'). Summarize and incorporate relevant info from the last 2 messages in chat_history into responses to maintain context. If the user says 'запомни' or 'remember', save the specified info or the last assistant response to key memory.
+- If asked 'how are you?', reply: 'I am functioning well, thank you. How are you?'
+- If asked about plans, reply: 'My purpose is to assist users effectively. What are your plans?'
+- If asked about the user ('who am I?', 'what do you know about me?'), provide a concise, formal summary of key facts from deep memory, key moments, and the current session.
+- If no data is available, say: 'I have limited information about you so far. Please share more about yourself.'
+- For general questions, provide clear and accurate responses or request clarification."""
+}
 
 def load_custom_settings(file_path):
     """Loads custom user settings from a JSON file"""
@@ -51,7 +51,6 @@ def load_custom_settings(file_path):
         print(f"{colorama.Fore.RED}⚠️ Error decoding {file_path}. Using default behavior.{colorama.Style.RESET_ALL}")
         return ""
 
-SYSTEM_PROMPT = load_system_prompt(system_prompt_file)
 CUSTOM_INSTRUCTIONS = load_custom_settings(custom_settings_file)
 
 async def type_text(text, color=colorama.Fore.GREEN, delay=0.02):
@@ -64,7 +63,7 @@ async def type_text(text, color=colorama.Fore.GREEN, delay=0.02):
 async def display_token(token, in_code_block=False, last_token_was_space=False):
     """Displays a token with proper spacing and code block handling"""
     if not token.strip() and not in_code_block:
-        return last_token_was_space  # Skip empty tokens outside code blocks
+        return last_token_was_space
     
     if token.startswith('```') or token.endswith('```'):
         if in_code_block and token.endswith('```'):
@@ -75,14 +74,13 @@ async def display_token(token, in_code_block=False, last_token_was_space=False):
             print(colorama.Fore.GREEN + token, end='\n', flush=True)
             await asyncio.sleep(token_display_delay)
             return True
-        return in_code_block  # Skip further processing if token is just '```'
+        return in_code_block
 
     if in_code_block:
         print(colorama.Fore.GREEN + token, end='', flush=True)
         await asyncio.sleep(token_display_delay)
         return token.endswith('\n') or token.endswith(' ')
     
-    # Handle natural text outside code blocks
     if last_token_was_space and not token.startswith(('.', ',', '!', '?', ':', ';', '\n', ' ')):
         print(colorama.Fore.GREEN + ' ', end='', flush=True)
     print(colorama.Fore.GREEN + token, end='', flush=True)
@@ -113,43 +111,77 @@ def split_text(text, max_tokens, type="prompt"):
     
     return parts
 
-def summarize_key_points(chat_history, num_messages=3):
-    """Summarizes the last num_messages user messages"""
-    user_messages = [msg for msg in chat_history if msg["role"] == "user"][-num_messages:]
-    return user_messages[:min(num_messages, len(user_messages))]
+def analyze_input_for_memory(text):
+    """Analyzes user input to determine if it should go to key or deep memory"""
+    text_lower = text.lower()
+    deep_keywords = ["люблю", "хочу", "зовут", "мой", "мне", "предпочитаю", "обожаю", "love", "want", "called", "my", "i", "prefer"]
+    key_keywords = ["сделал", "произошло", "важно", "событие", "did", "happened", "important", "event"]
+    if text_lower.endswith("?") or any(q in text_lower for q in ["что", "как", "кто", "где", "когда", "почему", "what", "how", "who", "where", "when", "why"]):
+        return None
+    
+    if any(keyword in text_lower for keyword in deep_keywords):
+        return "deep"
+    elif any(keyword in text_lower for keyword in key_keywords):
+        return "key"
+    if "я" in text_lower and any(id_word in text_lower for id_word in ["зовут", "called", "программист", "programmer"]):
+        return "deep"
+    return None
 
-def compile_memory(chat_history, key_memories, previous_compiled_memory):
-    """Compiles chat_history and key_memories into compiled_memory with duplicate check"""
-    compiled = []
-    existing_contents = {msg["content"] for msg in previous_compiled_memory}
-    keywords = Counter()
+async def process_command_with_ai(user_input, chat_history):
+    """Uses AI to interpret commands"""
+    messages = [
+        {"role": "system", "content": "You are a command interpreter. Identify if the input is a command (e.g., exit, clear, remember, recall, key, moment, messages, запомнить, вспомнить, очистить) and return it in the format: /command [args]. Return None if not a command."},
+        {"role": "user", "content": f"Interpret this input: '{user_input}'"}
+    ]
+    try:
+        response = await asyncio.to_thread(ollama.chat, model=model_name, messages=messages, options={"num_ctx": max_context_size})
+        interpreted_command = response["message"]["content"].strip()
+        return interpreted_command if interpreted_command.startswith("/") else None
+    except Exception as e:
+        print(f"{colorama.Fore.RED}⚠️ Error interpreting command: {e}{colorama.Style.RESET_ALL}")
+        return None
 
-    for msg in chat_history:
-        if msg["role"] == "user":
-            compiled_content = f"User said: {msg['content']}"
-            if compiled_content not in existing_contents:
-                compiled.append({"role": "compiled", "content": compiled_content})
-                words = msg["content"].lower().split()
-                keywords.update([w for w in words if w in ["love", "want", "called"]])
+async def summarize_user_info(deep_memory, key_memories, chat_history):
+    """Summarizes user information from memory and chat history into a concise, formal description."""
+    deep_info = [msg["content"] for msg in deep_memory if msg["role"] == "user"]
+    key_info = [msg["content"] for msg in key_memories if msg["role"] == "user"]
+    chat_info = [msg["content"] for msg in chat_history if msg["role"] == "user"]
 
-    for msg in key_memories:
-        if msg["content"] not in existing_contents:
-            compiled.append({"role": "compiled", "content": msg["content"]})
+    all_info = list(set(deep_info + key_info + chat_info))
+    if not all_info:
+        return "I have limited information about you so far. Please share more about yourself."
 
-    final_compiled = []
-    seen_keywords = set()
-    for entry in compiled:
-        content_lower = entry["content"].lower()
-        key_phrase = tuple(w for w in content_lower.split() if w in ["love", "want", "called"])
-        if key_phrase not in seen_keywords or "User said" not in entry["content"]:
-            final_compiled.append(entry)
-            seen_keywords.add(key_phrase)
+    summary_prompt = (
+        "Create a concise and formal summary about the user based on the following data: "
+        f"{', '.join(all_info)}. "
+        "Exclude repetitive or minor details, focus on key facts, and present the information in a coherent manner."
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an assistant specialized in creating concise and accurate summaries. "
+                "Respond formally, avoid slang, and combine facts into a cohesive description."
+            )
+        },
+        {"role": "user", "content": summary_prompt}
+    ]
 
-    return final_compiled
+    try:
+        response = await asyncio.to_thread(
+            ollama.chat,
+            model=model_name,
+            messages=messages,
+            options={"num_ctx": max_context_size}
+        )
+        return response["message"]["content"].strip()
+    except Exception as e:
+        print(f"{colorama.Fore.RED}⚠️ Error summarizing user info: {e}{colorama.Style.RESET_ALL}")
+        return "I have information about you, but I cannot summarize it right now."
 
 async def split_context(chat_history, user_input_part, key_memories, deep_memory, compiled_memory, max_tokens):
     context_parts = [SYSTEM_PROMPT["content"]]
-    if CUSTOM_INSTRUCTIONS:  # Add custom instructions to context
+    if CUSTOM_INSTRUCTIONS:
         context_parts.append(f"Custom Instructions: {CUSTOM_INSTRUCTIONS}")
     if deep_memory:
         context_parts.append("Deep Memory (preferences):")
@@ -232,12 +264,30 @@ async def process_prompt_part(prompt_part, chat_history, key_memories, deep_memo
             total_tokens = estimate_tokens("\n".join(f"{m['role']}: {m['content']}" for m in messages))
             await type_text(f"ℹ️ Total context: {total_tokens} tokens", colorama.Fore.CYAN, delay=0.02)
 
-            if any(keyword in prompt_part.lower() for keyword in ["who am i", "what do you know", "what do you remember"]):
-                user_info = "\nKnown about user:\n"
-                for msg in deep_memory + chat_history:
-                    if msg["role"] == "user" and any(kw in msg["content"].lower() for kw in ["called", "love", "want"]):
-                        user_info += f"- {msg['content']}\n"
-                messages.insert(-1, {"role": "system", "content": user_info if user_info.strip() != "Known about user:" else "I don’t know much about you yet, tell me something!"})
+            # Handle explicit memory requests
+            if "запомни" in prompt_part.lower() or "remember" in prompt_part.lower():
+                if len(chat_history) >= 2 and "свои слова" in prompt_part.lower():
+                    last_response = chat_history[-2]["content"] if chat_history[-2]["role"] == "assistant" else None
+                    if last_response:
+                        key_memories.append({"role": "assistant", "content": last_response})
+                        await save_memory(key_memories, key_memory_file)
+                        await type_text(f"🤖 Saved my last response to key memory: {last_response}", colorama.Fore.CYAN, delay=0.02)
+                        return "OK"
+                else:
+                    key_memories.append({"role": "user", "content": prompt_part})
+                    await save_memory(key_memories, key_memory_file)
+                    await type_text(f"🤖 Saved to key memory: {prompt_part}", colorama.Fore.CYAN, delay=0.02)
+                    return "OK"
+
+            # Handle user info requests
+            if any(keyword in prompt_part.lower() for keyword in ["who am i", "what do you know", "what do you remember", "что ты знаешь", "кто я"]):
+                summary = await summarize_user_info(deep_memory, key_memories, chat_history)
+                response = f"Here is what I know about you: {summary}"
+                for char in response:
+                    print(colorama.Fore.GREEN + char, end='', flush=True)
+                    await asyncio.sleep(token_display_delay)
+                print(colorama.Style.RESET_ALL)
+                return response.strip()
 
             payload = {
                 "model": model_name,
@@ -306,7 +356,7 @@ async def main():
     compiled_memory = await load_memory(compiled_memory_file)
     message_count = len(chat_history) // 2
 
-    await type_text(f"🤖 Started {model_name}. Use slash commands: /exit, /clear, /remember, /remember_key_moment, /recall, /remember N messages.", delay=0.02)
+    await type_text(f"🤖 Started {model_name}. Commands: exit, clear, remember, remember_key_moment, recall, remember N messages (with or without /).", delay=0.02)
     await type_text(f"ℹ️ Max tokens: {max_tokens}, Max prompt tokens: {max_prompt_tokens}, Max response tokens: {max_response_tokens}, Max chat tokens: {max_chat_tokens}, Max deep tokens: {max_deep_tokens}, Context size: {max_context_size}", colorama.Fore.CYAN, delay=0.02)
     if CUSTOM_INSTRUCTIONS:
         await type_text(f"ℹ️ Custom instructions loaded: {CUSTOM_INSTRUCTIONS}", colorama.Fore.CYAN, delay=0.02)
@@ -316,87 +366,88 @@ async def main():
             user_input = input(f"{colorama.Fore.YELLOW}You: {colorama.Style.RESET_ALL}")
             input_lower = user_input.lower().strip()
 
-            if input_lower.startswith("/"):
-                command = input_lower
-            else:
-                command_keywords = ["exit", "clear", "remember", "recall", "key", "moment", "messages", "запомнить", "вспомнить", "очистить"]
-                if any(keyword in input_lower for keyword in command_keywords):
-                    command = await process_command_with_ai(user_input, chat_history)
-                else:
-                    command = None
-
-            if command and command.startswith("/exit"):
-                await type_text("🤖 Shutting down...", delay=0.02)
-                await asyncio.gather(
-                    save_memory(chat_history, memory_file, max_chat_tokens),
-                    save_memory(key_memories, key_memory_file),
-                    save_memory(deep_memory, deep_memory_file, max_deep_tokens),
-                    save_memory(compiled_memory, compiled_memory_file)
-                )
-                break
-            elif command and command.startswith("/clear"):
-                chat_history = []
-                key_memories = []
-                deep_memory = []
-                compiled_memory = []
-                message_count = 0
-                await asyncio.gather(
-                    save_memory(chat_history, memory_file),
-                    save_memory(key_memories, key_memory_file),
-                    save_memory(deep_memory, deep_memory_file),
-                    save_memory(compiled_memory, compiled_memory_file)
-                )
-                await type_text("🤖 Memory cleared.", delay=0.02)
-                continue
-            elif command and command.startswith("/remember") and "key_moment" not in command and "messages" not in command:
-                if chat_history:
-                    summary = summarize_key_points(chat_history)
-                    deep_memory.extend(summary)
-                    await save_memory(deep_memory, deep_memory_file, max_deep_tokens)
-                    await type_text(f"🤖 Deep memory updated: {[msg['content'] for msg in summary]}", delay=0.02)
-                else:
-                    await type_text("🤖 No history to remember.", colorama.Fore.YELLOW, delay=0.02)
-                continue
-            elif command and command.startswith("/remember_key_moment"):
-                if chat_history:
-                    summary = summarize_key_points(chat_history, num_messages=3)
-                    key_memories.extend(summary)
-                    await save_memory(key_memories, key_memory_file)
-                    await type_text(f"🤖 Key moments updated: {[msg['content'] for msg in summary]}", delay=0.02)
-                else:
-                    await type_text("🤖 No history to remember.", colorama.Fore.YELLOW, delay=0.02)
-                continue
-            elif command and command.startswith("/remember") and "messages" in command:
-                try:
-                    parts = command.split()
-                    num = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 3
+            # Check if input is a command (with or without /)
+            command = input_lower if input_lower.startswith("/") else await process_command_with_ai(user_input, chat_history)
+            if command:
+                if command.startswith("/exit") or command == "exit":
+                    await type_text("🤖 Shutting down...", delay=0.02)
+                    await asyncio.gather(
+                        save_memory(chat_history, memory_file, max_chat_tokens),
+                        save_memory(key_memories, key_memory_file),
+                        save_memory(deep_memory, deep_memory_file, max_deep_tokens),
+                        save_memory(compiled_memory, compiled_memory_file)
+                    )
+                    break
+                elif command.startswith("/clear") or command == "clear":
+                    chat_history = []
+                    key_memories = []
+                    deep_memory = []
+                    compiled_memory = []
+                    message_count = 0
+                    await asyncio.gather(
+                        save_memory(chat_history, memory_file),
+                        save_memory(key_memories, key_memory_file),
+                        save_memory(deep_memory, deep_memory_file),
+                        save_memory(compiled_memory, compiled_memory_file)
+                    )
+                    await type_text("🤖 Memory cleared.", delay=0.02)
+                elif command.startswith("/remember_key_moment") or command == "remember_key_moment":
                     if chat_history:
-                        summary = summarize_key_points(chat_history, num_messages=num)
+                        summary = summarize_key_points(chat_history, num_messages=3)
                         key_memories.extend(summary)
                         await save_memory(key_memories, key_memory_file)
-                        await type_text(f"🤖 Key moments updated ({num} messages): {[msg['content'] for msg in summary]}", delay=0.02)
+                        await type_text(f"🤖 Key moments updated: {[msg['content'] for msg in summary]}", delay=0.02)
                     else:
                         await type_text("🤖 No history to remember.", colorama.Fore.YELLOW, delay=0.02)
-                except ValueError:
-                    await type_text("⚠️ Specify a number, e.g., '/remember 5 messages'", colorama.Fore.RED, delay=0.02)
-                continue
-            elif command and command.startswith("/recall"):
-                if chat_history or deep_memory or compiled_memory or key_memories:
-                    await type_text("🤖 Here’s what I remember about you:", delay=0.02)
-                    if deep_memory:
-                        await type_text(f"From deep memory (preferences): {[msg['content'] for msg in deep_memory]}", colorama.Fore.CYAN, delay=0.02)
-                    if key_memories:
-                        await type_text(f"From key moments: {[msg['content'] for msg in key_memories]}", colorama.Fore.CYAN, delay=0.02)
-                    if compiled_memory:
-                        await type_text(f"From compiled memory: {[msg['content'] for msg in compiled_memory][-5:]}", colorama.Fore.CYAN, delay=0.02)
-                    if chat_history:
-                        user_info = [msg["content"] for msg in chat_history if msg["role"] == "user"]
-                        await type_text(f"From current session: {user_info}", colorama.Fore.CYAN, delay=0.02)
-                else:
-                    await type_text("🤖 I don’t know anything about you yet.", colorama.Fore.YELLOW, delay=0.02)
-                continue
+                elif command.startswith("/remember") or command.startswith("remember"):
+                    if "messages" in command:
+                        try:
+                            parts = command.split()
+                            num = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 3
+                            if chat_history:
+                                summary = summarize_key_points(chat_history, num_messages=num)
+                                deep_memory.extend(summary)
+                                await save_memory(deep_memory, deep_memory_file, max_deep_tokens)
+                                await type_text(f"🤖 Deep memory updated ({num} messages): {[msg['content'] for msg in summary]}", delay=0.02)
+                            else:
+                                await type_text("🤖 No history to remember.", colorama.Fore.YELLOW, delay=0.02)
+                        except ValueError:
+                            await type_text("⚠️ Specify a number, e.g., 'remember 5 messages'", colorama.Fore.RED, delay=0.02)
+                    else:
+                        if chat_history:
+                            summary = summarize_key_points(chat_history)
+                            deep_memory.extend(summary)
+                            await save_memory(deep_memory, deep_memory_file, max_deep_tokens)
+                            await type_text(f"🤖 Deep memory updated: {[msg['content'] for msg in summary]}", delay=0.02)
+                        else:
+                            await type_text("🤖 No history to remember.", colorama.Fore.YELLOW, delay=0.02)
+                elif command.startswith("/recall") or command == "recall":
+                    if chat_history or deep_memory or compiled_memory or key_memories:
+                        await type_text("🤖 Here’s what I remember about you:", delay=0.02)
+                        if deep_memory:
+                            await type_text(f"From deep memory (preferences): {[msg['content'] for msg in deep_memory]}", colorama.Fore.CYAN, delay=0.02)
+                        if key_memories:
+                            await type_text(f"From key moments: {[msg['content'] for msg in key_memories]}", colorama.Fore.CYAN, delay=0.02)
+                        if compiled_memory:
+                            await type_text(f"From compiled memory: {[msg['content'] for msg in compiled_memory][-5:]}", colorama.Fore.CYAN, delay=0.02)
+                        if chat_history:
+                            user_info = [msg["content"] for msg in chat_history if msg["role"] == "user"]
+                            await type_text(f"From current session: {user_info}", colorama.Fore.CYAN, delay=0.02)
+                    else:
+                        await type_text("🤖 I don’t know anything about you yet.", colorama.Fore.YELLOW, delay=0.02)
+                continue  # Skip further processing for commands
 
-            # Regular message processing if not a command
+            # Regular message processing (not a command)
+            memory_type = analyze_input_for_memory(user_input)
+            if memory_type == "deep":
+                deep_memory.append({"role": "user", "content": user_input})
+                await save_memory(deep_memory, deep_memory_file, max_deep_tokens)
+                await type_text(f"🤖 Saved to deep memory: {user_input}", colorama.Fore.CYAN, delay=0.02)
+            elif memory_type == "key":
+                key_memories.append({"role": "user", "content": user_input})
+                await save_memory(key_memories, key_memory_file)
+                await type_text(f"🤖 Saved to key memory: {user_input}", colorama.Fore.CYAN, delay=0.02)
+
             prompt_parts = split_text(user_input, max_prompt_tokens, type="prompt")
             combined_response = ""
 
@@ -434,6 +485,11 @@ async def main():
             break
         except Exception as e:
             await type_text(f"⚠️ Error: {e}", colorama.Fore.RED, delay=0.02)
+
+def summarize_key_points(chat_history, num_messages=3):
+    """Summarizes the last num_messages user messages"""
+    user_messages = [msg for msg in chat_history if msg["role"] == "user"][-num_messages:]
+    return user_messages[:min(num_messages, len(user_messages))]
 
 if __name__ == "__main__":
     asyncio.run(main())
